@@ -1,0 +1,381 @@
+/* Optimizando querys*/
+
+--En el where no tienen que ir funciones por que el indice no se va a ejecutar.
+
+Ejemplo: 
+
+SELECT * FROM applicants 
+WHERE SUBSTRING(email, 0, CHARINDEX ('@', email,0)) = 'LouiseJSmith') /*Malisimo*/
+
+Alter table applicants ADD EmailLocalPart as Substring(email, 0 , charindex('@', email,0)) /Se puede hacer esto 
+y posteriormente crear el indice 
+
+CREATE INDEX IX_Applicants_Email
+on Applicants (EmailLocalPart).
+
+/**Incluir columnas para que se busquen por los indices*/
+
+Cuando tenemos un Key lookup, quiere decir que el indice se esta usando, pero faltan algunas columnas
+del select que se deberian de agregar para que el indice funcione. 
+
+Sintaxis: 
+
+CREATE INDEX IX_Students_Email 
+on Students (Email) -- Email por parte del Where
+INCLUDE (FirstName,LastName) -- Columnas del Select
+
+
+/** Over Indexing (Sobre Indexacion)*/
+
+Si los indices son buenos, por que no crear un indice para cada columna? 
+Respuesta: 
+
+Los indices requieren mantenimiento, por lo tanto crea indices que sean usados en tus
+SQL declaraciones. 
+
+No hay que crear indices que no se vayan a ocupar. 
+
+Cuando se hace una operacion DML (Insert, Update, Delete) ocurre una actualizacion de los indices
+de una tabla. 
+
+Por lo tanto, Considerar los indices como Inversiones. 
+
+
+/* Interpretando las recomendaciones de SQL SERVER*/ 
+
+Cuando ejecutamos el plan de ejecucion de SQL SERVER a veces obtenemos recomendacion de creacion de indexes, 
+esta recomendacion de indice esta hecho solo para esa sentencia SQL, por lo tanto si siempre usamos la recomendacion 
+de SQL vamos a tener una sobre indexacion en la tabla, lo cual puede afectar negativamente el rendimiento de la base de datos. 
+
+Hay que tener cuidado con los indices que vamos a crear, tratar de crear indices que sirvan para la mayoria de los casos que se 
+quieren cubrir. 
+
+/*Modulo 4: Encontrando cuellos de botella en SQL SERVER*/ --Para este modulo se requiere permisos para ver el estado del servidor 
+con las DMV
+
+/*Parte 2: Obteniendo Informacion Acerca de las Sessiones de SQL y Recursos*/
+
+DMV = Dynamic management views y DMFS = Dynamic Management Functions.
+
+Las DMVs retornan informacion acerca del estado del servidor, estas se usan para saber la salud de la instancia del servidor, diagnosticar problemas y tunear el performance. 
+
+EJECUTAR LA SIGUIENTE QUERY: 
+
+SELECT 
+database_id,
+session_id,
+status,
+login_time,
+cpu_time,
+memory_usage,
+reads,
+writes, 
+logical_reads,
+host_name,
+program_name,
+host_process_id,
+client_interface_name,
+login_name as database_login_name,
+last_request_start_time,
+FROM sys.dm_exec_sessions
+WHERE is_user_process=1
+ORDER BY cpu_time DESC; 
+
+Esta query proporciona informacion util acerca de los procesos que se estan ejecutando en el servidor, para poder identificar los cuellos de botella y que procesos son los que mas estan demandando recursos. 
+
+como recomendacion, hay que agregar a la cadena de conexion el atributo de 
+application name para saber de que aplicacion se esta ejecutando la query.
+
+<add name= "MyConnectionString" connectionString="Server=localhost\sqldev;Database:{databasename};User id= {username};password={password};
+Application Name = {friendly application name}"/>
+
+
+/*Part 3: Encontrar que Sentencias SQL se estan ejecutando actualmente*/
+
+Tenemos la siguiente Query: 
+
+-- Finding statements running in the database right now (including if a statement is blocked by another)
+-- -----------------------------------------------------------------------------------------------
+SELECT
+        [DatabaseName] = db_name(rq.database_id),
+        s.session_id, 
+        rq.status,
+        [SqlStatement] = SUBSTRING (qt.text,rq.statement_start_offset/2,
+            (CASE WHEN rq.statement_end_offset = -1 THEN LEN(CONVERT(NVARCHAR(MAX),
+            qt.text)) * 2 ELSE rq.statement_end_offset END - rq.statement_start_offset)/2),        
+        [ClientHost] = s.host_name,
+        [ClientProgram] = s.program_name, 
+        [ClientProcessId] = s.host_process_id, 
+        [SqlLoginUser] = s.login_name,
+        [DurationInSeconds] = datediff(s,rq.start_time,getdate()),
+        rq.start_time,
+        rq.cpu_time,
+        rq.logical_reads,
+        rq.writes,
+        [ParentStatement] = qt.text,
+        p.query_plan,
+        rq.wait_type,
+        [BlockingSessionId] = bs.session_id,
+        [BlockingHostname] = bs.host_name,
+        [BlockingProgram] = bs.program_name,
+        [BlockingClientProcessId] = bs.host_process_id,
+        [BlockingSql] = SUBSTRING (bt.text, brq.statement_start_offset/2,
+            (CASE WHEN brq.statement_end_offset = -1 THEN LEN(CONVERT(NVARCHAR(MAX),
+            bt.text)) * 2 ELSE brq.statement_end_offset END - brq.statement_start_offset)/2)
+    FROM sys.dm_exec_sessions s
+    INNER JOIN sys.dm_exec_requests rq
+        ON s.session_id = rq.session_id
+    CROSS APPLY sys.dm_exec_sql_text(rq.sql_handle) as qt
+    OUTER APPLY sys.dm_exec_query_plan(rq.plan_handle) p
+    LEFT OUTER JOIN sys.dm_exec_sessions bs
+        ON rq.blocking_session_id = bs.session_id
+    LEFT OUTER JOIN sys.dm_exec_requests brq
+        ON rq.blocking_session_id = brq.session_id
+    OUTER APPLY sys.dm_exec_sql_text(brq.sql_handle) as bt
+    WHERE s.is_user_process =1
+        AND s.session_id <> @@spid
+ AND rq.database_id = DB_ID()  -- Comment out to look at all databases
+    ORDER BY rq.start_time ASC;
+
+Esta query nos puede brindar el plan de execucion de las querys que se estan corriendo. 
+
+Tambien nos brinda: 
+
+-Si una query esta siendo bloqueada,
+-Las que se estan ejecutando actualmente, 
+-Los tiempos de ejecucionm 
+-Si es parte de un procedimiento almacenado etc, 
+-El parentStatement nos dice si esta dentro de un procedimiento o es una query normal, 
+-El apartado de ClientHost, ClientProgram, ClientProcessId y SqlLoginUser nos brindan informacion de donde esta viniendo la query, ya sea una app asp, escritorio etc. 
+-Tenemos las estadisticas que son DurationInSeconds, star_time,cpu_time,logical_reads,writes etc
+
+Con las lecturas logicas podemos saber cuanto de recursos se estan ocupando actualemnte. 
+
+-El apartado de Block sirve para ver que querys estan siendo bloqueadas. 
+Si no estan siendo bloqueadas salen NULL
+
+Tener el plan de ejecucion de las querys es realmente util por que podemos ver 
+cuales de las querys se estan ejecutando bien y teniendo un buen desempeño y cuales no.
+
+
+/*Parte 4: Encontrando los mas lentas y mas caras Sentencias SQLS./*
+
+
+Cuando SQL corre una query hace un plan de ejecucion, el cual queda en cache y se generan estatisticas del plan.
+
+Por eso es que a veces ejecutas una query, dilata mucho y luego volves a ejecutar una similar y dilata menos, pero no es el valor real de la consulta. 
+
+/*Parte 5: Obteniendo las recomendaciones de SQL SERVER en indices faltantes*/
+
+
+usando la siguiente DMV query 
+
+SELECT 
+	TableName = d.statement, 
+	d.equality_columns,
+	d.inequality_columns,
+	s.user_scans,
+	s.user_seeks,
+	s.avg_total_user_cost,
+	s.avg_user_impact,
+	AverageCostSavings = ROUND(s.avg_total_user_cost * (s.avg_user_impact/100.0),3),
+	TotalCostSavings   = ROUND(S.avg_total_user_cost * (s.avg_user_impact/100.0) * (s.user_seeks+s.user_scans),3)
+from sys.dm_db_missing_index_groups g 
+INNER JOIN sys.dm_db_missing_index_group_stats s
+	ON s.group_handle = g.index_group_handle
+INNER JOIN sys.dm_db_missing_index_details d 
+	ON d.index_handle = g.index_handle
+WHERE d.database_id = db_id()
+ORDER BY TableName, TotalCostSavings DESC
+
+Podemos obtener lo siguiente, informacion acerca de las estadisticas de sql la cual nos dice donde podemos crear un indice y donde sera mas util. 
+
+Las columnas de TableName nos dice el nombre de la tabla, Las otras que siguen nos dicen 
+las columnas de las que se puede hacer el indice etc, las user Scan y user Seeks nos dicen 
+el numero de veces que SQL SERVER podria hacer hecho uso del indice scan o index Seek. 
+
+Tambien podemos ver el costo del uso de los indices, asi como el porcentaje de mejora que podiramos obtener al crear ese indice, las ultimas dos columnas son calculaciones que nos dicen: 
+
+AvergeCostSavings: El promedio de costo ahorrado si tuvieramos este indice, 
+TotalCostSavings:  El total de recursos que se hubieran ahorrado con el indice.
+
+Aun asi ejecutando el plan, no hay que hacerle tanto caso a SQL hay que valorar la situacion y lo que ahorra para ver que indice podemos crear para no tener una sobre indexacion. 
+
+Por lo general, se debe de ver los resultados de las columnas y tomar una decision sobre que indice crear. 
+
+tomar las columnas que mas se repitan en el resultado para indexar, es lo que puede ser mas efectivo. 
+
+
+/*Parte 6: Encontrando Indices que no son usados*/
+
+- Getting Stats on What Indexes are Used and What Indexes are Not
+-- ------------------------------------------------------------------------------------------------
+SELECT
+    [DatabaseName] = DB_Name(db_id()),
+    [TableName] = OBJECT_NAME(i.object_id),
+    [IndexName] = i.name, 
+    [IndexType] = i.type_desc,
+    [TotalUsage] = IsNull(user_seeks, 0) + IsNull(user_scans, 0) + IsNull(user_lookups, 0),
+    [UserSeeks] = IsNull(user_seeks, 0),
+    [UserScans] = IsNull(user_scans, 0), 
+    [UserLookups] = IsNull(user_lookups, 0),
+    [UserUpdates] = IsNull(user_updates, 0)
+FROM sys.indexes i 
+INNER JOIN sys.objects o
+    ON i.object_id = o.object_id
+LEFT OUTER JOIN sys.dm_db_index_usage_stats s
+    ON s.object_id = i.object_id
+    AND s.index_id = i.index_id
+WHERE 
+    (OBJECTPROPERTY(i.object_id, 'IsMsShipped') = 0)
+ORDER BY [TableName], [IndexName];
+
+La siguiente DMv Query nos ayudara a saber que indices no se estan actualizando mucho, nos ayudara a saber que indices borrar por que estos afectan al costo de mantenimiento de ellos mismos. 
+
+La primera columna retorna el nmombre la base de datos, la segunda la tabla y el tercero el nombre del indice, la cuarta el tipo de indice. 
+
+Las que importan son las siguientes, las estadisticas, 
+UserScans y userSeeks, nos dice las veces que SQL SERVER Ocupo el Indice.
+
+Basicamente las otras columnas nos dice cuantas veces SQL uso esa cualidad (la de la columna) 
+
+Como siempre hay que analizar que indice botar y si no es costoso para nosotros. 
+
+/*Modulo 5: Capturar que esta haciendo tu aplicacion dentro de SQL SERVER*/
+
+/*Parte 1: Introduccion*/
+
+Que es una SQL Trace?
+
+Una traza sql se refiere a la captura y registro de las consultas SQL que se ejecutan en una base de datos durante un periodo de tiempo especifico. Estas no sirven para saber el rednimiento, analisis y diagnostico de consulta en la base de datos. La traza SQL registra informacion detallada sobre las consultas SQL, Como el tiempo de ejecucion, los recursos utilizados y las tablas afectadas. 
+
+
+ Por que deberiamos saber acerca de las Trazas SQL ? 
+
+-Nos ayuda a saber que Statement se esta corriendo actualmente y en que orden. 
+-Nos da stadisticas guardadas por cada statement. 
+
+
+Donde las trazas pueden ser usadas? 
+
+en los entornos de Dev para saber como la applicacion funciona, en Test para determinar los errores mediante los log y en Produccion para trackear los statementes que exceden el numero de hilos. 
+
+
+En sql server hay dos maneras de usar las tazas, si es SQL SERVER 2008 R2 and pior con el SQL Profiler. 
+
+Con el SQL Server 2012 o mas nuevo, SQL Azure usando SQL SERVER Extended events. 
+
+Pero las trazas requieren permisos de alto nivel en el servidior, tener en cuenta eso. 
+Esto por que sql captura todas las querys que se estan ejecutando en el momento.
+
+En produccion para correr una traza probablemente necesitaras un dBA  para poder usarla. 
+
+Tienes que entender la capacidad, entonces deberias de preguntar primero antes de crear. 
+
+/*Modulo 5, Parte 2: Estableciendo una Traza SQL */
+
+Por lo general, en el apartado de Events Selection dejar por lo general todo por defecto */
+Entender que filtros son importantes.
+
+Chequear que el textData de RPc Completed siempre este activoq, el resto por default. 
+Check en el apartado de show al events
+
+
+Activar el user Error Mesagge en Errors and Warnings para saber donde esta tronando la aplicacion, puede servir como una aplicaciobn Debugin 
+
+Activar el user error message nos sirve como el principal filtro q necesitamos. 
+
+Activar el column filter puede tener un impacto negativo en todo por que se marea el sql de calle
+
+/*Part 3 : Corriendo una traza SQL? 
+
+La traza en sql sirve para capturar las cosas que se estan haciendo en el servidor, 
+correr una traza demanda muchos recursos por lo tanto se recomienda hacerlo solo localmente, si lo vamos a hacer en un entorno de produccion hacerlo solo por un momento breve de tiempo, de otra manera estariamos afectando el rendimiento del server.
+
+La traza la podemos exportar de diferentes maneras dentro de la pestania file, y se puede sacar la info en tablas etc para su posterior analisis. 
+
+/*Corriendo una traza en el lado del servidor*/
+
+-Es mas eficiente que una traza interactiva
+- Se usa el SQL profiler para definir la traza.
+- Generar un archivo de comandos sql para correr la traza.
+
+Con la traza que previamente habiamos creado y pausado, exportarla como SQL Query, posteriror a eso procedemos a abrir la query y cambiar la direccion del archivo por donde esta la query que estamos tocando o trabajando.
+
+La query al ejecutarla nos dara el id de la traza, ese id lo vamos a sustituir en los siguientes comandos:
+
+
+---Obtener informacion de la traza 
+
+SELECT 
+MAX(CASE WHEN property = 2 THEN value END) As TraceFile,
+MAX(CASE WHEN property = 3 THEN value END) As MaxSize,
+MAX(CASE WHEN property = 4 THEN value END) As StopTime,
+MAX(CASE WHEN property = 5) THEN 
+	CASE value
+		WHEN 1 THEN 'Running'
+		WHEN 0 THEN 'Stopped'
+	 END
+	END)
+FROM sys.fn_trace_getinfo(0)
+group by traceid
+
+
+Posterior mente podemos ejecutar los siguientes comandos: 
+
+--Parar la Traza
+exec sp_trace_setstatus @TraceId, 0 
+
+--Restar la traza 
+exec sp_trace_setstatus @TraceId,1 
+
+--Remove the trace definition from SQL SERVER 
+exec sp_trace_setstatu @TraceID,2 
+
+Este archivo de query (recordar la direccion del archivo) ya ejecutado lo podemos abrir en el sql profiler para verlo de manera en como vemos las trazas. 
+
+
+/*Parte 5: Introduccion al uso de Extenden Events para las trazas SQL*/
+
+Para el uso de Extended events dependiendo de la version de SQL se necesitaran permisos para ejecutarla. 
+
+si es SQL SERVER 2008 r2 -- Se necesita un permiso 
+
+si es SQL Server 2012 + ---Se necesita lo siguiente: 
+
+ALTER ANY EVENT SESSION permission 
+
+VIEW SERVER STATE permission needed to use SSMS GUI
+
+/*Parte 6: Setiando la Extended Events Trace Session*/
+
+
+Para empezar dentro del SSMS hay ir a la carpeta de Management y Extended events, ahi empezar a configurar lo del tutorial.
+
+La verdad es que esta parte si esta pesadisisima, ver el video otra vez por favor.
+
+En Management, Extended Events, Sessions configuramos nuestro Extended Event. 
+
+Ponemos una Session Name y un Template, en el template seleccionamos que es un Query Batch Tracking. 
+
+La verdad es que mejor mirar el tutorial, el evento extendido se tiene que configurar en base a lo que realmente necesitamos.
+
+La diferencia de los Extended Events con los SQL Trace , es que esta consume recursos minimos que la traza SQL, y lo podemos ocupar para lo mismo, recopilar informacion acerca de lo que pasa en el servidor o instancia SQL. 
+
+Todo esto se puede configurar y exportar en una tabla o en un CSV para su posterior analisis,
+
+/*Parte 7: Extended Events Trace in Azure*/
+
+En conclusion: 
+
+/* SQL SERVER tracing nos permite saber que esta pasando adentro de la base de datos.
+
+Capturar exactamente la secuencia de Comandos que estan siendo ejecutados.
+
+Capturar el rendimiento de cada statement.
+
+Capturar cuanto tiempo necesita un statement para ser ejecutado.
+
+Si estas usando una version de SQL SERVER 2008 R2 y anteriores, para correr las trazas se usa el SQL Profiler. 
+
+Para SQL SERVER 2012 y mas nuevos, Tambien SQL Azure. Se usan los Extends EVents. 
